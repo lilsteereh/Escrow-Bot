@@ -1,0 +1,32 @@
+name: Deploy to Droplet
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Deploy to droplet
+        run: |
+          ssh -o StrictHostKeyChecking=no root@104.131.25.130 "
+            cd /root/EscrowBot || git clone git@github.com:lilsteereh/Escrow-Bot.git /root/EscrowBot
+            cd /root/EscrowBot
+            git fetch origin main
+            git reset --hard origin/main
+            source /root/EscrowBot/.venv/bin/activate || python3 -m venv /root/EscrowBot/.venv && source /root/EscrowBot/.venv/bin/activate
+            pip install -r requirements.txt
+            systemctl daemon-reload
+            systemctl restart escrow-admin || true
+            systemctl restart escrow-bot || true
+          "
