@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Depends, Form, HTTPException, status, Body
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
 
 from sqlalchemy import (
     Column, Integer, String, DateTime, Text, create_engine, select, func
@@ -22,9 +23,11 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 # Env
 # -------------------------
 load_dotenv()
-ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
-if not ADMIN_PANEL_TOKEN:
-    raise RuntimeError("ADMIN_PANEL_TOKEN missing in .env")
+ADMIN_USER = os.getenv("ADMIN_USER", "").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", "").strip()
+if not (ADMIN_USER and ADMIN_PASSWORD and ADMIN_SESSION_SECRET):
+    raise RuntimeError("ADMIN_USER, ADMIN_PASSWORD, and ADMIN_SESSION_SECRET must be set in .env")
 
 # -------------------------
 # DB setup (same schema/table names as the bot)
@@ -105,18 +108,56 @@ def compute_dispute_fee(asset: str, amount_units: decimal.Decimal) -> decimal.De
     return fee
 
 # -------------------------
-# Auth dependency
+# Auth dependency (session-based)
 # -------------------------
-def require_token(request: Request):
-    token = request.headers.get("X-Admin-Token") or request.query_params.get("token")
-    if token != ADMIN_PANEL_TOKEN:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+def require_login(request: Request):
+    if not request.session.get("auth"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Login required")
     return True
 
 # -------------------------
 # App
 # -------------------------
 app = FastAPI(title="EscrowBot Admin")
+app.add_middleware(SessionMiddleware, secret_key=ADMIN_SESSION_SECRET)
+
+# -------------------------
+# Global exception handler to redirect 401s to /login
+# -------------------------
+@app.exception_handler(HTTPException)
+async def _auth_redirect_handler(request: Request, exc: HTTPException):
+    if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+        return RedirectResponse(url="/login", status_code=303)
+    raise exc
+
+# -------------------------
+# Login/logout routes
+# -------------------------
+@app.get("/login", response_class=HTMLResponse)
+def login_form():
+    body = f"""
+    <h1>Admin Login</h1>
+    <form method='post' action='/login'>
+      <div><input name='username' placeholder='Username' required autofocus></div>
+      <div style='margin-top:8px'><input type='password' name='password' placeholder='Password' required></div>
+      <div style='margin-top:12px'><button type='submit'>Sign in</button></div>
+    </form>
+    """
+    return html_page("Login", body)
+
+@app.post("/login")
+def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    if username == ADMIN_USER and password == ADMIN_PASSWORD:
+        request.session["auth"] = True
+        request.session["user"] = username
+        return RedirectResponse(url="/", status_code=303)
+    return html_page("Login", "<p>Invalid credentials</p><p><a href='/login'>Try again</a></p>")
+
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/login", status_code=303)
 
 # -------------------------
 # HTML helpers
@@ -154,7 +195,7 @@ def fmt_amt(asset: str, amt: str) -> str:
 # -------------------------
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(_: bool = Depends(require_token)):
+def dashboard(_: bool = Depends(require_login)):
     with SessionLocal() as s:
         total_deals = s.scalar(select(func.count(Deal.id))) or 0
         open_disputes = s.scalar(select(func.count(Dispute.id)).where(Dispute.status=="OPEN")) or 0
@@ -173,7 +214,7 @@ def dashboard(_: bool = Depends(require_token)):
         f"<td>{html.escape(d.status)}</td>"
         f"<td>{fmt_amt(d.asset, d.amount)}</td>"
         f"<td>{html.escape(d.seller_username or '')}</td>"
-        f"<td><a href='/deal/{d.id}?token={ADMIN_PANEL_TOKEN}'>View</a></td>"
+        f"<td><a href='/deal/{d.id}'>View</a></td>"
         f"</tr>"
         for d in recent
     )
@@ -192,13 +233,13 @@ def dashboard(_: bool = Depends(require_token)):
       <tr><th>ID</th><th>Status</th><th>Amount</th><th>Seller</th><th></th></tr>
       {rows}
     </table>
-    <p><a class='button' href='/offers/pending?token={ADMIN_PANEL_TOKEN}'>View pending offers</a></p>
-    <p><a class='button' href='/disputes?token={ADMIN_PANEL_TOKEN}'>View all disputes</a></p>
+    <p><a class='button' href='/offers/pending'>View pending offers</a></p>
+    <p><a class='button' href='/disputes'>View all disputes</a></p>
     """
     return html_page("Dashboard", body)
 
 @app.get("/offers/pending", response_class=HTMLResponse)
-def offers_pending(_: bool = Depends(require_token)):
+def offers_pending(_: bool = Depends(require_login)):
     with SessionLocal() as s:
         deals = s.execute(
             select(Deal).where(Deal.status == "PENDING_ACCEPT").order_by(Deal.created_at.desc())
@@ -214,9 +255,8 @@ def offers_pending(_: bool = Depends(require_token)):
             f"<td>{html.escape(d.status)}</td>"
             f"<td>{d.created_at}</td>"
             f"<td>"
-            f"<a href='/deal/{d.id}?token={ADMIN_PANEL_TOKEN}' class='button'>Open</a>"
+            f"<a href='/deal/{d.id}' class='button'>Open</a>"
             f"<form method='post' action='/offer/{d.id}/cancel' class='inline' style='margin-left:8px'>"
-            f"<input type='hidden' name='token' value='{ADMIN_PANEL_TOKEN}'/>"
             f"<button type='submit'>Cancel</button>"
             f"</form>"
             f"</td>"
@@ -226,7 +266,7 @@ def offers_pending(_: bool = Depends(require_token)):
         rows.append("<tr><td colspan='6'>No pending offers</td></tr>")
 
     body = f"""
-    <p><a href='/?token={ADMIN_PANEL_TOKEN}'>← Back</a></p>
+    <p><a href='/'>← Back</a></p>
     <h1>Pending Offers</h1>
     <table>
       <tr><th>ID</th><th>Seller</th><th>Amount</th><th>Status</th><th>Created</th><th>Actions</th></tr>
@@ -237,9 +277,7 @@ def offers_pending(_: bool = Depends(require_token)):
 
 
 @app.post("/offer/{deal_id}/cancel")
-def offer_cancel(deal_id: int, token: str = Form(None)):
-    if token != ADMIN_PANEL_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def offer_cancel(deal_id: int, _: bool = Depends(require_login)):
     with SessionLocal() as s:
         d = s.get(Deal, deal_id)
         if not d:
@@ -249,10 +287,10 @@ def offer_cancel(deal_id: int, token: str = Form(None)):
         d.status = "CANCELLED"
         d.updated_at = datetime.utcnow()
         s.commit()
-    return RedirectResponse(url=f"/offers/pending?token={ADMIN_PANEL_TOKEN}", status_code=303)
+    return RedirectResponse(url=f"/offers/pending", status_code=303)
 
 @app.get("/disputes", response_class=HTMLResponse)
-def disputes_list(status_filter: Optional[str] = None, _: bool = Depends(require_token)):
+def disputes_list(status_filter: Optional[str] = None, _: bool = Depends(require_login)):
     with SessionLocal() as s:
         q = select(Dispute).order_by(Dispute.created_at.desc())
         if status_filter:
@@ -267,12 +305,12 @@ def disputes_list(status_filter: Optional[str] = None, _: bool = Depends(require
             f"<td>{d.deal_id}</td>"
             f"<td>{html.escape(d.status)}</td>"
             f"<td>{html.escape(d.reason or '')}</td>"
-            f"<td><a href='/deal/{d.deal_id}?token={ADMIN_PANEL_TOKEN}'>Open</a></td>"
+            f"<td><a href='/deal/{d.deal_id}'>Open</a></td>"
             f"</tr>"
         )
     body = f"""
     <h1>Disputes</h1>
-    <p><a href='/?token={ADMIN_PANEL_TOKEN}'>← Back</a></p>
+    <p><a href='/'>← Back</a></p>
     <table>
       <tr><th>ID</th><th>Deal</th><th>Status</th><th>Reason</th><th></th></tr>
       {rows}
@@ -281,7 +319,7 @@ def disputes_list(status_filter: Optional[str] = None, _: bool = Depends(require
     return html_page("Disputes", body)
 
 @app.get("/deal/{deal_id}", response_class=HTMLResponse)
-def deal_detail(deal_id: int, _: bool = Depends(require_token)):
+def deal_detail(deal_id: int, _: bool = Depends(require_login)):
     with SessionLocal() as s:
         d = s.get(Deal, deal_id)
         if not d:
@@ -298,15 +336,12 @@ def deal_detail(deal_id: int, _: bool = Depends(require_token)):
         <div class='card'>
           <h3>Resolve</h3>
           <form method='post' action='/deal/{d.id}/resolve' class='inline'>
-            <input type='hidden' name='token' value='{ADMIN_PANEL_TOKEN}' />
             <button name='action' value='release'>Resolve → Release to Seller</button>
           </form>
           <form method='post' action='/deal/{d.id}/resolve' class='inline' style='margin-left:8px'>
-            <input type='hidden' name='token' value='{ADMIN_PANEL_TOKEN}' />
             <button name='action' value='refund'>Resolve → Refund to Buyer</button>
           </form>
           <form method='post' action='/deal/{d.id}/resolve' class='inline' style='margin-left:8px'>
-            <input type='hidden' name='token' value='{ADMIN_PANEL_TOKEN}' />
             <input name='split_pct' placeholder='Seller % (e.g. 60)' style='width:140px' />
             <button name='action' value='split'>Resolve → Split</button>
           </form>
@@ -334,14 +369,13 @@ def deal_detail(deal_id: int, _: bool = Depends(require_token)):
         <div class='card'>
           <h3>Pending offer</h3>
           <form method='post' action='/offer/{d.id}/cancel' class='inline'>
-            <input type='hidden' name='token' value='{ADMIN_PANEL_TOKEN}' />
             <button>Cancel offer</button>
           </form>
         </div>
         """
 
     body = f"""
-    <p><a href='/?token={ADMIN_PANEL_TOKEN}'>← Back</a></p>
+    <p><a href='/'>← Back</a></p>
     <h1>Deal #{d.id}</h1>
     <div class='card'>
       <div>Status: <b>{html.escape(d.status)}</b></div>
@@ -364,10 +398,8 @@ def deal_resolve(
     deal_id: int,
     action: str = Form(...),
     split_pct: Optional[str] = Form(None),
-    token: str = Form(None)
+    _: bool = Depends(require_login)
 ):
-    if token != ADMIN_PANEL_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
     with SessionLocal() as s:
         d = s.get(Deal, deal_id)
         if not d:
@@ -389,7 +421,7 @@ def deal_resolve(
                 disp.status = "RESOLVED"
                 disp.loser_id = loser_id
             s.commit()
-            return RedirectResponse(url=f"/deal/{deal_id}?token={ADMIN_PANEL_TOKEN}", status_code=303)
+            return RedirectResponse(url=f"/deal/{deal_id}", status_code=303)
 
         if action == "refund":
             d.status = "CANCELLED"
@@ -399,7 +431,7 @@ def deal_resolve(
                 disp.status = "RESOLVED"
                 disp.loser_id = loser_id
             s.commit()
-            return RedirectResponse(url=f"/deal/{deal_id}?token={ADMIN_PANEL_TOKEN}", status_code=303)
+            return RedirectResponse(url=f"/deal/{deal_id}", status_code=303)
 
         if action == "split":
             try:
@@ -420,6 +452,6 @@ def deal_resolve(
                 disp.status = "RESOLVED"
                 disp.loser_id = loser_id
             s.commit()
-            return RedirectResponse(url=f"/deal/{deal_id}?token={ADMIN_PANEL_TOKEN}", status_code=303)
+            return RedirectResponse(url=f"/deal/{deal_id}", status_code=303)
 
         raise HTTPException(400, "Unknown action")
