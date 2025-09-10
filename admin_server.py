@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Depends, Form, HTTPException, status
+from fastapi import FastAPI, Request, Depends, Form, HTTPException, status, Body
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -158,6 +158,7 @@ def dashboard(_: bool = Depends(require_token)):
     with SessionLocal() as s:
         total_deals = s.scalar(select(func.count(Deal.id))) or 0
         open_disputes = s.scalar(select(func.count(Dispute.id)).where(Dispute.status=="OPEN")) or 0
+        pending = s.scalar(select(func.count(Deal.id)).where(Deal.status=="PENDING_ACCEPT")) or 0
         funded = s.scalar(select(func.count(Deal.id)).where(Deal.status=="FUNDED")) or 0
         released = s.scalar(select(func.count(Deal.id)).where(Deal.status=="RELEASED")) or 0
         disputed = s.scalar(select(func.count(Deal.id)).where(Deal.status=="DISPUTED")) or 0
@@ -180,6 +181,7 @@ def dashboard(_: bool = Depends(require_token)):
     <h1>EscrowBot Admin</h1>
     <div class='summary'>
       <div class='card'>Total deals<br><b>{total_deals}</b></div>
+      <div class='card'>Pending offers<br><b>{pending}</b></div>
       <div class='card'>FUNDED<br><b>{funded}</b></div>
       <div class='card'>RELEASED<br><b>{released}</b></div>
       <div class='card'>DISPUTED<br><b>{disputed}</b></div>
@@ -190,9 +192,64 @@ def dashboard(_: bool = Depends(require_token)):
       <tr><th>ID</th><th>Status</th><th>Amount</th><th>Seller</th><th></th></tr>
       {rows}
     </table>
+    <p><a class='button' href='/offers/pending?token={ADMIN_PANEL_TOKEN}'>View pending offers</a></p>
     <p><a class='button' href='/disputes?token={ADMIN_PANEL_TOKEN}'>View all disputes</a></p>
     """
     return html_page("Dashboard", body)
+
+@app.get("/offers/pending", response_class=HTMLResponse)
+def offers_pending(_: bool = Depends(require_token)):
+    with SessionLocal() as s:
+        deals = s.execute(
+            select(Deal).where(Deal.status == "PENDING_ACCEPT").order_by(Deal.created_at.desc())
+        ).scalars().all()
+
+    rows = []
+    for d in deals:
+        rows.append(
+            f"<tr>"
+            f"<td>{d.id}</td>"
+            f"<td>{html.escape(d.seller_username or '')}</td>"
+            f"<td>{fmt_amt(d.asset, d.amount)}</td>"
+            f"<td>{html.escape(d.status)}</td>"
+            f"<td>{d.created_at}</td>"
+            f"<td>"
+            f"<a href='/deal/{d.id}?token={ADMIN_PANEL_TOKEN}' class='button'>Open</a>"
+            f"<form method='post' action='/offer/{d.id}/cancel' class='inline' style='margin-left:8px'>"
+            f"<input type='hidden' name='token' value='{ADMIN_PANEL_TOKEN}'/>"
+            f"<button type='submit'>Cancel</button>"
+            f"</form>"
+            f"</td>"
+            f"</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='6'>No pending offers</td></tr>")
+
+    body = f"""
+    <p><a href='/?token={ADMIN_PANEL_TOKEN}'>← Back</a></p>
+    <h1>Pending Offers</h1>
+    <table>
+      <tr><th>ID</th><th>Seller</th><th>Amount</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+      {''.join(rows)}
+    </table>
+    """
+    return html_page("Pending Offers", body)
+
+
+@app.post("/offer/{deal_id}/cancel")
+def offer_cancel(deal_id: int, token: str = Form(None)):
+    if token != ADMIN_PANEL_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    with SessionLocal() as s:
+        d = s.get(Deal, deal_id)
+        if not d:
+            raise HTTPException(404, "Deal not found")
+        if d.status != "PENDING_ACCEPT":
+            raise HTTPException(409, f"Cannot cancel in status {d.status}")
+        d.status = "CANCELLED"
+        d.updated_at = datetime.utcnow()
+        s.commit()
+    return RedirectResponse(url=f"/offers/pending?token={ADMIN_PANEL_TOKEN}", status_code=303)
 
 @app.get("/disputes", response_class=HTMLResponse)
 def disputes_list(status_filter: Optional[str] = None, _: bool = Depends(require_token)):
@@ -271,6 +328,18 @@ def deal_detail(deal_id: int, _: bool = Depends(require_token)):
         </div>
         """
 
+    cancel_block = ""
+    if d.status == "PENDING_ACCEPT":
+        cancel_block = f"""
+        <div class='card'>
+          <h3>Pending offer</h3>
+          <form method='post' action='/offer/{d.id}/cancel' class='inline'>
+            <input type='hidden' name='token' value='{ADMIN_PANEL_TOKEN}' />
+            <button>Cancel offer</button>
+          </form>
+        </div>
+        """
+
     body = f"""
     <p><a href='/?token={ADMIN_PANEL_TOKEN}'>← Back</a></p>
     <h1>Deal #{d.id}</h1>
@@ -286,6 +355,7 @@ def deal_detail(deal_id: int, _: bool = Depends(require_token)):
     </div>
     {disp_block}
     {decision_form}
+    {cancel_block}
     """
     return html_page(f"Deal {deal_id}", body)
 
