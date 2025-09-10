@@ -1,0 +1,17 @@
+
+aiogram
+
+python-dotenv
+
+aiohttp
+
+SQLAlchemy
+
+fastapi
+
+uvicorn[standard]
+
+python-multipart
+
+itsdangerous
+
